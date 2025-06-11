@@ -1,0 +1,6 @@
+# requirements.txt
+tensorflow>=2.10
+ddsp>=0.27
+librosa
+soundfile
+numpy

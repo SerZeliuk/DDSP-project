@@ -1,75 +1,151 @@
-"""Train gated WaveNet on guitar dataset with snapped‑MIDI f0 + pitch loss."""
-import os, numpy as np, tensorflow as tf
+# train_synthesizer.py
+
+import os
+import numpy as np
+import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks  import ModelCheckpoint
+from tensorflow.keras.callbacks import ModelCheckpoint
+from losses import SpectralLoss
+from audio_processor import AudioProcessor
+from ddsp_model import Encoder, Decoder, DDSPAutoencoder
+from synths import HarmonicPlusNoiseSynth
 
-from audio_processor       import AudioProcessor, make_per_sample_features
-from wavenet_synthesizer   import WaveNetSynthesizer
-
-# ─── paths ───────────────────────────────────────────────────
+# ─── Paths & Hyperparams ───────────────────────────────────────
 GUITAR_WAV   = "DDSP Reaper/Guitar_dataset.wav"
-WEIGHTS_FILE = "models/GuitarSynth.weights.h5"
-STATS_FILE   = "models/feature_stats.npz"
-os.makedirs("models", exist_ok=True)
+MODELS_DIR   = "models"
+WEIGHTS_FILE = os.path.join(MODELS_DIR, "GuitarDDSP.weights.h5")
+os.makedirs(MODELS_DIR, exist_ok=True)
 
-# ─── constants ───────────────────────────────────────────────
-SR=16000; HOP=512; FR=250; HARM=5
-WIN=16384; STRIDE=8192; BATCH=1; EPOCHS=30; LR=1e-4
+SR           = 16000
+FRAME_RATE   = 250
+HOP          = SR // FRAME_RATE        # 512
+WINDOW_SEC   = 4
+SAMPLES_WIN  = WINDOW_SEC * SR         # 64 000
+FRAMES_WIN   = WINDOW_SEC * FRAME_RATE # 1000
+BATCH        = 4
+EPOCHS       = 50
+LR           = 1e-4
 
-# ─── util: snap Hz → MIDI within ±50 cents ───────────────────
-def hz_to_midi_quantised(f0_hz: np.ndarray):
-    midi = 69 + 12*np.log2(np.maximum(f0_hz, 1e-6)/440.0)
-    midi_q = np.round(midi)
-    cents  = (midi - midi_q)*100
-    midi_q[np.abs(cents) > 50] = 0   # treat far bins as unvoiced 0
-    return midi_q.astype(np.float32)
+# ─── 1) LOAD + EXTRACT FRAME-LEVEL FEATURES ────────────────────
+proc = AudioProcessor(
+    GUITAR_WAV,
+    sr=SR,
+    frame_rate=FRAME_RATE,
+    model_capacity='full'
+)
+data      = proc.extract_features()
+audio     = data['audio'].astype(np.float32)     # [N_samples]
+f0_frames = data['f0'].astype(np.float32)        # [N_frames]
+loudness  = data['loudness'].astype(np.float32)  # [N_frames]
 
-# ─── build dataset ───────────────────────────────────────────
-proc  = AudioProcessor(GUITAR_WAV, SR, HOP, FR, HARM)
-audio, _  = proc.load_audio()
-# per-sample features: [f0(Hz), harms, loud]
-feats = make_per_sample_features(audio, proc)   
-# replace first column with snapped MIDI & store auxiliary target
-f0_hz = feats[:, 0]
-feats[:,0] = hz_to_midi_quantised(f0_hz)
+# ─── 2) BUILD WINDOWED DATASETS ────────────────────────────────
+def make_windows(x, size, step):
+    return (
+        tf.data.Dataset
+          .from_tensor_slices(x)
+          .window(size, step, drop_remainder=True)
+          .flat_map(lambda w: w.batch(size))
+    )
 
-# normalise columns
-mean, std = feats.mean(0), feats.std(0)+1e-6
-feats = (feats-mean)/std
-np.savez(STATS_FILE, mean=mean, std=std)
-print("Saved feature stats →", STATS_FILE)
+audio_windows    = make_windows(audio,    SAMPLES_WIN,  SAMPLES_WIN)
+f0_windows       = make_windows(f0_frames,FRAMES_WIN,   FRAMES_WIN)
+loudness_windows = make_windows(loudness, FRAMES_WIN,   FRAMES_WIN)
 
-# prepare windowed tf.data
-feat_ds  = tf.data.Dataset.from_tensor_slices(feats)
-aud_ds   = tf.data.Dataset.from_tensor_slices(audio.astype(np.float32))
-full_ds  = tf.data.Dataset.zip((feat_ds, aud_ds))
-full_ds  = full_ds.window(WIN, STRIDE, drop_remainder=True)
-full_ds  = full_ds.flat_map(lambda f,y: tf.data.Dataset.zip((f.batch(WIN), y.batch(WIN))))
-full_ds  = full_ds.shuffle(512).batch(BATCH).prefetch(tf.data.AUTOTUNE)
+ds = tf.data.Dataset.zip((audio_windows, f0_windows, loudness_windows))
 
-# ─── model & custom loss ─────────────────────────────────────
-feat_dim = feats.shape[1]
-model = WaveNetSynthesizer(num_blocks=10, filters=64, kernel_size=2,
-                           dilation_rates=[1,2,4,8,16,32])
-model(tf.zeros((1,100,feat_dim)))   # build
+# ─── 3) COMPUTE steps_per_epoch ───────────────────────────────
+NUM_WINDOWS = len(audio) // SAMPLES_WIN
+print(f"Computed NUM_WINDOWS = {NUM_WINDOWS}")
 
-mse = tf.keras.losses.MeanSquaredError()
+# ─── 4) PREPARE FOR TRAINING ───────────────────────────────────
+ds = (
+    ds
+    .shuffle(512)
+    .repeat()
+    .batch(BATCH)
+    .prefetch(tf.data.AUTOTUNE)
+)
 
-@tf.function
+# ─── 5) PACK INPUTS & LABELS ───────────────────────────────────
+def pack(aud_batch, f0_batch, loud_batch):
+    # Add channel dims for f0 & loudness
+    f0_in   = f0_batch[..., tf.newaxis]   # [B, FRAMES_WIN, 1]
+    loud_in = loud_batch[..., tf.newaxis] # [B, FRAMES_WIN, 1]
+
+    # Return a dict mapping input names to tensors, plus target audio
+    x = {
+        "audio":    aud_batch,  # model arg #1
+        "f0":       f0_in,      # model arg #2
+        "loudness": loud_in     # model arg #3
+    }
+    return x, aud_batch
+
+ds = ds.map(pack, num_parallel_calls=tf.data.AUTOTUNE)
+
+# Optional sanity-check:
+print("DATASET ELEMENT SPEC:", ds.element_spec)
+# Should print something like:
+# ({'audio': TensorSpec((None,64000),float32),
+#   'f0':    TensorSpec((None,1000,1),float32),
+#   'loudness':TensorSpec((None,1000,1),float32)},
+#  TensorSpec((None,64000),float32))
+
+# ─── 6) BUILD DDSP AUTOENCODER & FUNCTIONAL TRAINING MODEL ─────
+# Instantiate your components
+enc   = Encoder(conv_channels=64, num_layers=4, kernel_size=3, latent_dim=128)
+dec   = Decoder(latent_dim=128, n_harmonics=64, hidden_units=256, upsample_rate=HOP)
+synth = HarmonicPlusNoiseSynth(
+    n_samples=SAMPLES_WIN,
+    sample_rate=SR,
+    n_harmonics=64,
+    window_size=257
+)
+
+# Core autoencoder (subclassed)
+ae = DDSPAutoencoder(enc, dec, synth)
+
+# Build a functional Model so Keras knows there are 3 separate inputs
+audio_in = tf.keras.Input(shape=(SAMPLES_WIN,),     name="audio")
+f0_in    = tf.keras.Input(shape=(FRAMES_WIN,1),     name="f0")
+loud_in  = tf.keras.Input(shape=(FRAMES_WIN,1),     name="loudness")
+recon    = ae(audio_in, f0_in, loud_in)             # calls ae.call(...)
+model    = tf.keras.Model(
+    inputs=[audio_in, f0_in, loud_in],
+    outputs=recon,
+    name="ddsp_autoencoder"
+)
+
+model.summary()
+
+# ─── 7) LOSS & COMPILATION ─────────────────────────────────────
+spectral_loss = SpectralLoss(
+    fft_sizes=(2048,1024,512,256),
+    loss_type='L1',
+    mag_weight=1.0,
+    logmag_weight=1.0
+)
 def loss_fn(y_true, y_pred):
-    # y_true: waveform (B,T)
-    # Add aux pitch target as snapped MIDI in first channel of features
-    f0_target = tf.expand_dims(feats[:,0], 0)  # quick broadcast
-    f0_pred, audio_pred = model.split_outputs(y_pred)
-    loss_wave = mse(y_true, audio_pred)
-    loss_f0   = mse(f0_target, f0_pred)
-    return loss_wave + 0.1*loss_f0
+    return spectral_loss(y_true, y_pred)
 
-model.compile(optimizer=Adam(LR), loss=loss_fn)
+model.compile(
+    optimizer=Adam(LR),
+    loss=loss_fn
+)
 
-ckpt = ModelCheckpoint(WEIGHTS_FILE, save_weights_only=True,
-                       save_best_only=True, monitor="loss", verbose=1)
+ckpt = ModelCheckpoint(
+    WEIGHTS_FILE,
+    save_weights_only=True,
+    save_best_only=True,
+    monitor='loss',
+    verbose=1
+)
 
-print("Starting training …")
-model.fit(full_ds, epochs=EPOCHS, callbacks=[ckpt])
-print("Training done. Weights →", WEIGHTS_FILE)
+# ─── 8) TRAIN ───────────────────────────────────────────────────
+print("Starting training…")
+model.fit(
+    ds,
+    epochs=EPOCHS,
+    steps_per_epoch=NUM_WINDOWS // BATCH,
+    callbacks=[ckpt]
+)
+print("Training complete. Weights saved to", WEIGHTS_FILE)

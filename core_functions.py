@@ -1051,7 +1051,7 @@ def harmonic_synthesis(frequencies: tf.Tensor,
                        harmonic_distribution: Optional[tf.Tensor] = None,
                        n_samples: int = 64000,
                        sample_rate: int = 16000,
-                       amp_resample_method: Text = 'window',
+                       amp_resample_method: Text = 'linear',
                        use_angular_cumsum: bool = False) -> tf.Tensor:
   """Generate audio from frame-wise monophonic harmonic oscillator bank.
 
@@ -1099,9 +1099,9 @@ def harmonic_synthesis(frequencies: tf.Tensor,
     harmonic_amplitudes = amplitudes
 
   # Create sample-wise envelopes.
-  frequency_envelopes = resample(harmonic_frequencies, n_samples)  # cycles/sec
+  frequency_envelopes = resample(harmonic_frequencies, n_samples, method='linear', add_endpoint=False)  # cycles/sec
   amplitude_envelopes = resample(harmonic_amplitudes, n_samples,
-                                 method=amp_resample_method)
+                                 method=amp_resample_method, add_endpoint=False)
 
   # Synthesize from harmonics [batch_size, n_samples].
   audio = oscillator_bank(frequency_envelopes,
@@ -1515,8 +1515,8 @@ def apply_window_to_impulse_response(impulse_response: tf.Tensor,
     window = tf.signal.fftshift(window, axes=-1)
 
   # Apply the window, to get new IR (both in zero-phase form).
-  window = tf.broadcast_to(window, impulse_response.shape)
-  impulse_response = window * tf.math.real(impulse_response)
+  window = tf.reshape(window, [1, 1, window_size])
+  impulse_response = tf.math.real(impulse_response) * tf.cast(window, impulse_response.dtype)
 
   # Put IR in causal form and trim zero padding.
   if padding > 0:

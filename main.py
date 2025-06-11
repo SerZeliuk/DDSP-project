@@ -1,69 +1,92 @@
-"""Inference using gated WaveNet with snapped-MIDI features & f0 plot."""
-import os, numpy as np, soundfile as sf, matplotlib.pyplot as plt, librosa
-from audio_processor       import AudioProcessor
-from wavenet_synthesizer   import WaveNetSynthesizer
+# main.py
 
-# ─── paths ───────────────────────────────────────────────────
-WEIGHTS_FILE = "models/GuitarSynth.weights.h5"
-STATS_FILE   = "models/feature_stats.npz"
-SOURCE_FILE  = "DDSP Reaper/DDSP Reaper_stems_Viloin-001.wav"
-OUTPUT_FILE  = "out/violin_as_guitar.wav"
+import os
+import numpy as np
+import soundfile as sf
+import tensorflow as tf
 
-SR=16000; HOP=512; FR=250; HARM=5
+from audio_processor import AudioProcessor
+from wavenet_synthesizer import WaveNetSynthesizer
+import visualize
 
-# util: snap Hz to MIDI ±50 cents
-def hz_to_midi_quantised(f):
-    midi = 69 + 12*np.log2(np.maximum(f,1e-6)/440.0)
-    midi_q = np.round(midi)
-    cents  = (midi-midi_q)*100
-    midi_q[np.abs(cents)>50] = 0
-    return midi_q.astype(np.float32)
+# ─── Hyperparameters ─────────────────────────────────────────
+SR         = 16000
 
-def main():
-    # stats
-    stats = np.load(STATS_FILE)
-    mean, std = stats['mean'], stats['std']
+# ─── Paths ────────────────────────────────────────────────────
+INPUT_WAV   = "DDSP Reaper/DDSP Reaper_stems_Viloin-001.wav"
+OUTPUT_WAV  = 'out/violin_to_guitar_work_please.wav'
+WEIGHTS     = 'models/GuitarSynthEncoder.weights.h5'
+STATS_FILE  = 'models/feature_stats.npz'
 
-    # extract feats
-    proc = AudioProcessor(SOURCE_FILE, SR, HOP, FR, HARM)
-    audio,_ = proc.load_audio()
-    feats   = proc.make_per_sample_features(audio)
-    feats[:,0] = hz_to_midi_quantised(feats[:,0])
-    feats = (feats-mean)/std
-    n_samples, feat_dim = feats.shape
+os.makedirs(os.path.dirname(OUTPUT_WAV), exist_ok=True)
 
-    # model
-    model = WaveNetSynthesizer(num_blocks=10, filters=64, kernel_size=2,
-                               dilation_rates=[1,2,4,8,16,32])
-    model(np.zeros((1,100,feat_dim)))
-    model.load_weights(WEIGHTS_FILE)
+# ─── Load normalization stats ─────────────────────────────────
+stats = np.load(STATS_FILE)
+mean, std = stats['mean'], stats['std']
 
-    # synthesis
-    y_pred = model.predict(feats[None,...], batch_size=1)[0]
-    _, y   = model.split_outputs(y_pred)   # use only audio channel
-    y = y[:n_samples].numpy().squeeze()
+# ─── Load audio + frame-level features via extract_features() ────
+proc = AudioProcessor(
+    INPUT_WAV,
+    sr=SR,
+    frame_rate=250,          # matches your training FRAME_RATE
+    model_capacity='full'    # or 'tiny', etc.
+)
+data = proc.extract_features()
+audio_in     = data['audio']        # [N_samples]
+f0_frames    = data['f0']           # [N_frames]
+conf_frames  = data['confidence']    # [N_frames]
+loud_frames  = data['loudness']      # [N_frames]
+hop_length   = data['hop_length']    # samples per frame
 
-    # f0 curves
-    f0_src, _, _ = librosa.pyin(audio.astype(np.float32), sr=SR,
-                                fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), hop_length=HOP)
-    f0_syn, _, _ = librosa.pyin(y.astype(np.float32), sr=SR,
-                                fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), hop_length=HOP)
-    f0_src, f0_syn = np.nan_to_num(f0_src), np.nan_to_num(f0_syn)
-    n_frames = min(len(f0_src), len(f0_syn))
-    t_fr = np.arange(n_frames)*(HOP/SR)
+# ─── Build per-sample feature array by repeating each frame ───────
+frame_feats = np.stack([f0_frames, conf_frames, loud_frames], axis=1)
+feats_in = np.repeat(frame_feats, hop_length, axis=0)
+feats_in = feats_in[: len(audio_in)]  # trim to match audio length
 
-    # plots
-    plt.figure(figsize=(10,3)); plt.plot(np.arange(n_samples)/SR, audio); plt.title('Source'); plt.tight_layout(); plt.show()
-    plt.figure(figsize=(10,3)); plt.plot(np.arange(n_samples)/SR, y); plt.title('Synthesised'); plt.tight_layout(); plt.show()
-    plt.figure(figsize=(10,3));
-    plt.plot(t_fr, f0_src[:n_frames], label='source f₀');
-    plt.plot(t_fr, f0_syn[:n_frames], label='synth  f₀');
-    plt.ylabel('Hz'); plt.xlabel('Time (s)'); plt.title('f₀ comparison'); plt.legend(); plt.tight_layout(); plt.show()
+# ─── Normalize using training stats ──────────────────────────────
+feats_norm = (feats_in - mean) / std
+n_samples, feat_dim = feats_norm.shape
 
-    # save
-    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    sf.write(OUTPUT_FILE, y, SR)
-    print('Saved →', OUTPUT_FILE)
+# ─── Visualize the input diagnostics ─────────────────────────────
+visualize.plot_input(
+    audio=audio_in,
+    sr=SR,
+    f0=f0_frames,
+    confidence=conf_frames,
+    loudness=loud_frames,
+    hop_length=hop_length,
+    frame_rate=int(SR / hop_length)
+)
 
-if __name__=='__main__':
-    main()
+# ─── Build & load your WaveNet model ─────────────────────────────
+model = WaveNetSynthesizer(
+    num_blocks=10,
+    filters=64,
+    kernel_size=2,
+    dilation_rates=[1, 2, 4, 8, 16, 32]
+)
+_ = model(tf.zeros((1, 100, feat_dim)))  # build
+model.load_weights(WEIGHTS)
+
+# ─── Run inference ───────────────────────────────────────────────
+y = model.predict(feats_norm[None, ...], batch_size=1)[0]  # [T, 2]
+f0_aux, audio_out = WaveNetSynthesizer.split_outputs(y)
+audio_out = audio_out[:n_samples]
+
+# ─── Recompute output frame-level features for plotting ──────────
+# We’ll use the same hop_length to downsample audio_out
+loud_out = proc.compute_loudness(audio_out)
+
+# ─── Visualize the output diagnostics ────────────────────────────
+visualize.plot_output(
+    audio=audio_out,
+    sr=SR,
+    f0=f0_aux,
+    loudness=loud_out,
+    hop_length=hop_length,
+    frame_rate=int(SR / hop_length)
+)
+
+# ─── Save the synthesized audio ──────────────────────────────────
+sf.write(OUTPUT_WAV, audio_out, SR)
+print(f"Saved → {OUTPUT_WAV}")
